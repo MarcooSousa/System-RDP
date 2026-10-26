@@ -1,0 +1,129 @@
+name: blank
+
+# Cria ou destrói uma VM Windows no Azure acessível SOMENTE via Tailscale.
+# Rode manualmente em Actions > blank > Run workflow.
+# Ao criar, o link de login do Tailscale aparece no resumo (Summary) do job.
+#
+# Secrets necessários (Settings > Secrets and variables > Actions):
+#   AZURE_CREDENTIALS   JSON do service principal (az ad sp create-for-rbac --sdk-auth)
+#   VM_ADMIN_PASSWORD   senha do administrador (12+ caracteres, com maiúscula/número/símbolo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "O que fazer"
+        type: choice
+        options: [create, destroy]
+        default: create
+      vm_size:
+        description: "Tamanho da VM (B1s é o do free tier; ~1 GB de RAM)"
+        default: Standard_B1s
+      location:
+        description: "Região do Azure"
+        default: brazilsouth
+
+env:
+  RG: rg-remote-desktop
+  VM: rd-win
+  ADMIN_USER: rdadmin
+
+jobs:
+  create:
+    if: ${{ inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Criar grupo de recursos e VM (sem portas abertas)
+        run: |
+          az group create -n "$RG" -l "${{ inputs.location }}" -o none
+          az vm create \
+            --resource-group "$RG" --name "$VM" \
+            --image MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition:latest \
+            --size "${{ inputs.vm_size }}" \
+            --admin-username "$ADMIN_USER" \
+            --admin-password "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            --nsg-rule NONE \
+            --public-ip-sku Standard \
+            -o none
+
+      - name: Instalar Tailscale, habilitar RDP e gerar link de login
+        run: |
+          cat > setup.ps1 <<'EOF'
+          param([string]$HostName)
+          $ErrorActionPreference = "Stop"
+
+          # Habilita Área de Trabalho Remota (acessível só pela interface do Tailscale)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Instala o Tailscale
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+
+          # 'tailscale up' sem chave fica esperando o login e imprime o link.
+          # Roda como tarefa agendada (SYSTEM) para continuar depois que este script terminar.
+          $ts  = "C:\Program Files\Tailscale\tailscale.exe"
+          $log = "C:\ts-login.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $cmd = "& '$ts' up --hostname=$HostName --unattended *> '$log'"
+          $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -Command `"$cmd`""
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+          Register-ScheduledTask -TaskName "tailscale-login" -Action $action -Principal $principal -Force | Out-Null
+          Start-ScheduledTask -TaskName "tailscale-login"
+
+          # Espera o link aparecer (até ~60 s)
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $log) {
+              $m = Select-String -Path $log -Pattern 'https://login\.tailscale\.com/\S+'
+              if ($m) { Write-Output "TS_LOGIN_URL=$($m.Matches[0].Value)"; exit 0 }
+            }
+          }
+          Write-Output "TS_LOGIN_URL=NOT_FOUND"
+          if (Test-Path $log) { Get-Content $log }
+          EOF
+
+          OUT=$(az vm run-command invoke \
+            --resource-group "$RG" --name "$VM" \
+            --command-id RunPowerShellScript \
+            --scripts @setup.ps1 \
+            --parameters "HostName=$VM" \
+            --query "value[0].message" -o tsv)
+          echo "$OUT"
+
+          URL=$(echo "$OUT" | tr -d '\r' | grep -o 'TS_LOGIN_URL=https[^[:space:]]*' | head -1 | cut -d= -f2- || true)
+
+          {
+            echo "## Conectar ao Tailscale"
+            if [ -n "$URL" ]; then
+              echo "- **1.** Abra este link e faça login: $URL"
+              echo "- **2.** Aprove a máquina **$VM** no painel do Tailscale, se pedir."
+              echo "- **3.** Pegue o IP \`100.x\` de **$VM** no painel (login.tailscale.com/admin/machines)."
+              echo "- **4.** Conecte por Área de Trabalho Remota (RDP) nesse IP, usuário \`$ADMIN_USER\`."
+              echo "- O link expira em alguns minutos; se expirar, rode \`destroy\` e \`create\` de novo."
+            else
+              echo "- Não consegui obter o link. Veja o log do passo acima."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$URL" ]; then
+            echo "::notice title=Link de login do Tailscale::$URL"
+          else
+            echo "::error::Link do Tailscale não encontrado"; exit 1
+          fi
+
+  destroy:
+    if: ${{ inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Apagar tudo (para de cobrar)
+        run: az group delete -n "$RG" --yes --no-wait
